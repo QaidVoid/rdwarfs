@@ -15,5 +15,6 @@
 #![warn(rust_2018_idioms, unreachable_pub)]
 
 mod error;
+pub mod format;
 
 pub use error::{Error, Result};
