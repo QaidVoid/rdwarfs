@@ -14,6 +14,7 @@
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms, unreachable_pub)]
 
+pub mod compression;
 mod error;
 pub mod format;
 
