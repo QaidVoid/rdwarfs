@@ -18,6 +18,8 @@ pub mod compression;
 mod error;
 pub mod format;
 #[cfg(feature = "read")]
+pub mod fs;
+#[cfg(feature = "read")]
 pub mod metadata;
 
 pub use error::{Error, Result};
