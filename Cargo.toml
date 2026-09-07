@@ -13,6 +13,54 @@ rust-version = "1.85"
 name = "rdwarfs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "dwarfsck"
+path = "src/bin/dwarfsck.rs"
+required-features = ["cli", "read"]
+
+[[bin]]
+name = "dwarfsextract"
+path = "src/bin/dwarfsextract.rs"
+required-features = ["cli", "read"]
+
+[[bin]]
+name = "dwarfs"
+path = "src/bin/dwarfs.rs"
+required-features = ["cli", "fuse"]
+
+[features]
+default = ["read", "cli", "parallel", "brotli", "lz4", "lzma", "zstd", "tar", "mmap"]
+
+# Capability groups. `read` is the library proper; FUSE pulls it in.
+read = []
+fuse = ["read", "dep:fuser"]
+
+# Per-codec gates. Each adds a decoder for one compression algorithm,
+# so a consumer pays only for the codecs its images actually use.
+brotli = ["dep:brotli"]
+flac = []
+lz4 = ["dep:lz4_flex"]
+lzma = ["dep:lzma-rs"]
+ricepp = []
+zstd = ["dep:zstd"]
+tar = ["dep:tar"]
+
+# Extract files across a thread pool. Deliberately optional: cargo
+# unifies features across a build graph, so a workspace holding both a
+# bulk extractor and a size-constrained reader needs to enable this for
+# one and not the other. Nothing on the random-access read path uses it.
+parallel = ["dep:rayon"]
+
+# The command-line binaries. A library consumer does not need an
+# argument parser.
+cli = ["dep:clap"]
+
+# Memory-map a whole image instead of reading it positionally. Fast,
+# but an I/O error faults the process rather than returning an error,
+# so a reader that cannot accept that should leave this off and use
+# `FileSource`.
+mmap = ["dep:memmap2"]
+
 [dependencies]
 brotli = { version = "8.0.2", optional = true }
 clap = { version = "4.6.6", features = ["derive"], optional = true }
