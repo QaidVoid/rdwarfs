@@ -1,0 +1,72 @@
+[package]
+name = "rdwarfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rdwarfs]
+path = ".."
+default-features = false
+features = ["read", "zstd", "lzma", "lz4", "brotli"]
+
+[[bin]]
+name = "parse_image"
+path = "fuzz_targets/parse_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_image"
+path = "fuzz_targets/verify_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress_zstd"
+path = "fuzz_targets/decompress_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress_lzma"
+path = "fuzz_targets/decompress_lzma.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress_lz4"
+path = "fuzz_targets/decompress_lz4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress_brotli"
+path = "fuzz_targets/decompress_brotli.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsst_decode"
+path = "fuzz_targets/fsst_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "walk_filesystem"
+path = "fuzz_targets/walk_filesystem.rs"
+test = false
+doc = false
+bench = false
