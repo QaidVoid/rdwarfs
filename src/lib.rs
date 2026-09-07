@@ -19,6 +19,8 @@ mod error;
 pub mod format;
 #[cfg(feature = "read")]
 pub mod fs;
+#[cfg(feature = "fuse")]
+pub mod fuse;
 #[cfg(feature = "read")]
 pub mod metadata;
 
