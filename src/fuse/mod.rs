@@ -19,8 +19,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem as FuseFilesystem, Generation, INodeNo,
-    LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem as FuseFilesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
+    Request,
 };
 
 use crate::Error;
@@ -152,22 +153,33 @@ impl FuseFilesystem for DwarfsFuse {
                 return;
             }
         };
-        let name_bytes = name.as_bytes();
-        let entries = match self.fs.read_dir(parent_ino) {
-            Ok(v) => v,
+        // Search the directory rather than listing it: a listing
+        // allocates a name for every entry, on every lookup, and a
+        // lookup happens for each path component of every open.
+        let child = match self.fs.lookup_child(parent_ino, name.as_bytes()) {
+            Ok(Some(inode)) => inode,
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
             Err(_) => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
-        let Some(entry) = entries.iter().find(|e| e.name == name_bytes) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        match self.attr_of(entry.inode) {
+        match self.attr_of(child) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(_) => reply.error(Errno::EIO),
         }
+    }
+
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        // A DwarFS image is immutable, so cached pages can never go
+        // stale. Without this the kernel discards a file's pages on
+        // every close and re-reads them through the daemon, which
+        // costs a round trip per read that the page cache could have
+        // served outright.
+        reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
