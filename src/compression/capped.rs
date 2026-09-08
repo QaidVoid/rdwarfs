@@ -73,6 +73,59 @@ impl io::Write for CappedWriter {
     }
 }
 
+/// A sink that stops the decoder once it holds `needed` bytes.
+///
+/// Sequential codecs cannot seek, but they can be cut short: serving a
+/// small read from the front of a large block only needs the prefix up
+/// to that read. The writer reports completion as an error because
+/// that is the only way to stop a codec that owns the output loop;
+/// [`PrefixWriter::is_complete`] identifies it so the caller can treat
+/// it as success.
+#[cfg(all(feature = "lzma", not(feature = "lzma-native")))]
+pub(crate) struct PrefixWriter {
+    buf: Vec<u8>,
+    needed: usize,
+}
+
+#[cfg(all(feature = "lzma", not(feature = "lzma-native")))]
+const PREFIX_COMPLETE: &str = "rdwarfs: prefix complete";
+
+#[cfg(all(feature = "lzma", not(feature = "lzma-native")))]
+impl PrefixWriter {
+    pub(crate) fn new(needed: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(needed),
+            needed,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Whether an error came from this writer having enough bytes.
+    pub(crate) fn is_complete(err: &std::io::Error) -> bool {
+        err.to_string().contains(PREFIX_COMPLETE)
+    }
+}
+
+#[cfg(all(feature = "lzma", not(feature = "lzma-native")))]
+impl std::io::Write for PrefixWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = self.needed.saturating_sub(self.buf.len());
+        let take = room.min(data.len());
+        self.buf.extend_from_slice(&data[..take]);
+        if self.buf.len() >= self.needed {
+            return Err(std::io::Error::other(PREFIX_COMPLETE));
+        }
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

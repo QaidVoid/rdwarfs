@@ -60,12 +60,20 @@ cli = ["dep:clap"]
 # so a reader that cannot accept that should leave this off and use
 # `FileSource`.
 mmap = ["dep:memmap2"]
+# Decode LZMA with liblzma rather than the pure-Rust `lzma_rs`.
+#
+# `lzma_rs` runs a stream to completion whatever the sink does, so
+# serving a small read from a large block decodes the whole block: 588ms
+# against 20ms for a 4 KiB read from a 64 MiB block. liblzma streams and
+# stops. The cost is a C dependency, so `lzma` alone stays pure Rust.
+lzma-native = ["lzma", "dep:liblzma"]
 
 [dependencies]
 brotli = { version = "8.0.2", optional = true }
 clap = { version = "4.6.6", features = ["derive"], optional = true }
 fuser = { version = "0.17.0", default-features = false, optional = true }
 libc = "0.2.186"
+liblzma = { version = "0.4.8", features = ["static"], optional = true }
 lz4_flex = { version = "0.13.1", optional = true }
 lzma-rs = { version = "0.3.0", optional = true }
 memmap2 = { version = "0.9.10", optional = true }

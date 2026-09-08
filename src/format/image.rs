@@ -185,6 +185,21 @@ impl Image {
         self.verify_sections(true)
     }
 
+    /// Decode at least `needed` bytes from the front of a section.
+    ///
+    /// Returns `None` when the codec cannot stop early. Verifies the
+    /// section hash first, exactly as a full decode does, so a partial
+    /// decode is no less checked than a whole one.
+    pub fn decompress_section_prefix(
+        &self,
+        record: &SectionRecord,
+        needed: usize,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let section = self.section_bytes(record)?;
+        verify_xxh3(&record.header, &section)?;
+        compression::decompress_prefix(record.header.compression, &section[HEADER_LEN..], needed)
+    }
+
     /// Hash every section, optionally including the slower SHA.
     ///
     /// Sections are independent, so on a build with the `parallel`

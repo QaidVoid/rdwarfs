@@ -27,6 +27,7 @@ read
 fuse
 read,zstd
 read,lzma
+read,lzma-native
 read,lz4
 read,brotli
 read,mmap

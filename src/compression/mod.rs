@@ -45,6 +45,32 @@ pub fn codec_name(codec: Compression) -> &'static str {
     }
 }
 
+/// Decode at least `needed` bytes from the front of a payload.
+///
+/// Returns `None` when the codec cannot stop early, in which case the
+/// caller decodes the whole payload. The result may be longer than
+/// `needed`; it is never shorter unless the payload ends first.
+#[cfg(feature = "read")]
+#[cfg_attr(
+    not(any(feature = "zstd", feature = "lzma")),
+    allow(unused_variables, reason = "no enabled codec can stop early")
+)]
+pub fn decompress_prefix(
+    codec: Compression,
+    src: &[u8],
+    needed: usize,
+) -> Result<Option<Vec<u8>>, Error> {
+    match codec {
+        #[cfg(feature = "zstd")]
+        Compression::Zstd => zstd::decompress_prefix(src, needed).map(Some),
+        #[cfg(feature = "lzma")]
+        Compression::Lzma => lzma::decompress_prefix(src, needed).map(Some),
+        // `None` is already a slice, and lz4 decodes a whole block in
+        // one call, so neither gains anything from stopping early.
+        _ => Ok(None),
+    }
+}
+
 /// Decode a compressed section payload.
 ///
 /// `cap` is the maximum number of decoded bytes the call may produce;

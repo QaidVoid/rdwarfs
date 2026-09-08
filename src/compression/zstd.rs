@@ -45,6 +45,27 @@ fn map_decode(err: io::Error) -> Error {
     }
 }
 
+/// Decode at least `needed` bytes from the front of the frame.
+///
+/// Stops as soon as the prefix is satisfied, so serving a small read
+/// from a large block does not decode the whole block.
+#[cfg(feature = "read")]
+pub(super) fn decompress_prefix(src: &[u8], needed: usize) -> Result<Vec<u8>, Error> {
+    use std::io::Read as _;
+    let mut decoder = zstd::Decoder::with_buffer(src).map_err(map_decode)?;
+    let mut out = vec![0u8; needed];
+    let mut filled = 0;
+    while filled < needed {
+        match decoder.read(&mut out[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(map_decode(e)),
+        }
+    }
+    out.truncate(filled);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
