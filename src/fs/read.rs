@@ -7,7 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::Error;
 use crate::format::{Image, SectionType};
-use crate::metadata::{Chunk, DirEntry, Directory, FsOptions, InodeData, Metadata, Schema};
+use crate::metadata::{
+    Chunk, DirEntry, Directory, FsOptions, InodeData, Metadata, Schema, StringTable,
+};
 
 use super::{InodeKind, mode_kind};
 
@@ -154,8 +156,8 @@ pub struct Filesystem {
     shared_files: Vec<u32>,
     large_hole_size: Vec<u64>,
     hole_block_index: Option<u32>,
-    names: Vec<Vec<u8>>,
-    symlinks: Vec<Vec<u8>>,
+    names: StringTable,
+    symlinks: StringTable,
     /// Devices table (field 17). Indexed by `inode - device_offset`,
     /// each entry is `(major << 32) | minor`. Empty when the image
     /// has no device nodes.
@@ -449,7 +451,6 @@ impl Filesystem {
             .ok_or_else(|| corrupt(format!("symlink_table index {slot} out of range")))?;
         self.symlinks
             .get(table_value as usize)
-            .map(|s| s.as_slice())
             .ok_or_else(|| corrupt(format!("symlinks index {table_value} out of range")))
     }
 
@@ -750,7 +751,6 @@ impl Filesystem {
     fn entry_name(&self, index: u32) -> Result<&[u8], Error> {
         self.names
             .get(index as usize)
-            .map(Vec::as_slice)
             .ok_or_else(|| corrupt(format!("name index {index} out of range")))
     }
 

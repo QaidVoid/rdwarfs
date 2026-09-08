@@ -263,8 +263,8 @@ fn names_and_symlinks_decode_through_fsst() {
     let names: Vec<String> = m
         .names()
         .unwrap()
-        .into_iter()
-        .map(|bytes| String::from_utf8(bytes).expect("valid utf-8 name"))
+        .iter()
+        .map(|bytes| String::from_utf8(bytes.to_vec()).expect("valid utf-8 name"))
         .collect();
     assert_eq!(
         names,
@@ -282,8 +282,8 @@ fn names_and_symlinks_decode_through_fsst() {
     let symlinks: Vec<String> = m
         .symlinks()
         .unwrap()
-        .into_iter()
-        .map(|bytes| String::from_utf8(bytes).expect("valid utf-8 symlink"))
+        .iter()
+        .map(|bytes| String::from_utf8(bytes.to_vec()).expect("valid utf-8 symlink"))
         .collect();
     assert_eq!(symlinks, vec!["hello.txt"]);
 }

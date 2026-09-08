@@ -19,5 +19,7 @@ pub(crate) mod thrift;
 pub use bitbuf::BitBuf;
 pub use frozen::{FieldView, Frozen, LayoutKind, OptionalView, Pos, RangeView};
 pub use fsst::{FSST_ESC, SymTable};
-pub use model::{Chunk, DEFAULT_LIST_CAP, DirEntry, Directory, FsOptions, InodeData, Metadata};
+pub use model::{
+    Chunk, DEFAULT_LIST_CAP, DirEntry, Directory, FsOptions, InodeData, Metadata, StringTable,
+};
 pub use schema::{Field, Layout, Schema};

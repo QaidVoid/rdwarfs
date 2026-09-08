@@ -196,6 +196,42 @@ struct DirectoryColumns {
     self_entry: Column,
 }
 
+/// A decoded string table.
+///
+/// All strings live in one buffer with an offset index, rather than a
+/// vector of vectors. A name table has tens of thousands of short
+/// entries, so one allocation instead of one per string both decodes
+/// faster and keeps a name lookup scanning contiguous memory.
+#[derive(Debug, Default, Clone)]
+pub struct StringTable {
+    data: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl StringTable {
+    /// Number of strings in the table.
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// Whether the table holds no strings.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The string at `index`, or `None` when out of range.
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index + 1)? as usize;
+        self.data.get(start..end)
+    }
+
+    /// Iterate the strings in order.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).filter_map(|i| self.get(i))
+    }
+}
+
 impl<'a> Metadata<'a> {
     /// Build a new typed view over the given schema and decoded blob.
     pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self, Error> {
@@ -464,7 +500,7 @@ impl<'a> Metadata<'a> {
     ///
     /// Resolves `compact_names` (field 24) first; falls back to the
     /// plain `list<string>` at field 10 when `compact_names` is unset.
-    pub fn names(&self) -> Result<Vec<Vec<u8>>, Error> {
+    pub fn names(&self) -> Result<StringTable, Error> {
         if let Some(table) = self.read_string_table(ids::COMPACT_NAMES)? {
             return Ok(table);
         }
@@ -472,7 +508,7 @@ impl<'a> Metadata<'a> {
     }
 
     /// Symlink-targets table, FSST-decompressed if needed.
-    pub fn symlinks(&self) -> Result<Vec<Vec<u8>>, Error> {
+    pub fn symlinks(&self) -> Result<StringTable, Error> {
         if let Some(table) = self.read_string_table(ids::COMPACT_SYMLINKS)? {
             return Ok(table);
         }
@@ -731,7 +767,7 @@ impl<'a> Metadata<'a> {
 
     /// Decode an `Optional<string_table>` root field. Returns `None`
     /// when the field is absent or unset.
-    fn read_string_table(&self, id: i16) -> Result<Option<Vec<Vec<u8>>>, Error> {
+    fn read_string_table(&self, id: i16) -> Result<Option<StringTable>, Error> {
         let Some(view) = self.field(id) else {
             return Ok(None);
         };
@@ -748,7 +784,7 @@ impl<'a> Metadata<'a> {
             return Ok(None);
         }
         let Some(value_layout_id) = value_layout_id else {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(StringTable::default()));
         };
         let st_layout = self.schema().layout(value_layout_id)?;
         let st_pos = opt.value_pos;
@@ -778,9 +814,9 @@ impl<'a> Metadata<'a> {
 
     /// Decode a root `list<string>` field by reading each element's
     /// string bytes via the relative-distance contract.
-    fn read_plain_string_list(&self, id: i16) -> Result<Vec<Vec<u8>>, Error> {
+    fn read_plain_string_list(&self, id: i16) -> Result<StringTable, Error> {
         let Some((list_layout, list_pos)) = self.resolve_list(id)? else {
-            return Ok(Vec::new());
+            return Ok(StringTable::default());
         };
         let kind = LayoutKind::of(list_layout, self.schema())?;
         let LayoutKind::Array { item_layout_id } = kind else {
@@ -798,11 +834,20 @@ impl<'a> Metadata<'a> {
             });
         }
         let item_layout = self.schema().layout(item_layout_id)?;
-        let mut out = Vec::with_capacity(range.count as usize);
+        let mut out = StringTable {
+            data: Vec::new(),
+            offsets: Vec::with_capacity(range.count as usize + 1),
+        };
+        out.offsets.push(0);
         for i in 0..range.count {
             let pos = self.frozen.element_pos(range, i)?;
             let bytes = self.frozen.read_string_bytes(pos, item_layout)?;
-            out.push(bytes.to_vec());
+            out.data.extend_from_slice(bytes);
+            let mark = u32::try_from(out.data.len()).map_err(|_| Error::Decode {
+                codec: "frozen2-model",
+                message: "string list exceeds 4 GiB".to_string(),
+            })?;
+            out.offsets.push(mark);
         }
         Ok(out)
     }
@@ -1055,7 +1100,7 @@ fn decode_string_table(
     symtab: Option<&[u8]>,
     index: &[u32],
     packed: bool,
-) -> Result<Vec<Vec<u8>>, Error> {
+) -> Result<StringTable, Error> {
     let offsets = if packed {
         let mut out = Vec::with_capacity(index.len() + 1);
         out.push(0u32);
@@ -1065,14 +1110,18 @@ fn decode_string_table(
         index.to_vec()
     };
     if offsets.len() < 2 {
-        return Ok(Vec::new());
+        return Ok(StringTable::default());
     }
 
     let table = match symtab {
         Some(bytes) => Some(SymTable::parse(bytes)?.0),
         None => None,
     };
-    let mut out = Vec::with_capacity(offsets.len() - 1);
+    let mut out = StringTable {
+        data: Vec::with_capacity(buffer.len() * 2),
+        offsets: Vec::with_capacity(offsets.len()),
+    };
+    out.offsets.push(0);
     for w in offsets.windows(2) {
         let start = w[0] as usize;
         let end = w[1] as usize;
@@ -1086,10 +1135,15 @@ fn decode_string_table(
             });
         }
         let slice = &buffer[start..end];
-        out.push(match &table {
-            Some(table) => table.decode_to_vec(slice)?,
-            None => slice.to_vec(),
-        });
+        match &table {
+            Some(table) => table.decode(slice, &mut out.data)?,
+            None => out.data.extend_from_slice(slice),
+        }
+        let mark = u32::try_from(out.data.len()).map_err(|_| Error::Decode {
+            codec: "frozen2-model",
+            message: "string table exceeds 4 GiB".to_string(),
+        })?;
+        out.offsets.push(mark);
     }
     Ok(out)
 }
@@ -1150,12 +1204,13 @@ mod tests {
             b"delta".to_vec(),
         ];
 
+        let flat = |t: StringTable| -> Vec<Vec<u8>> { t.iter().map(<[u8]>::to_vec).collect() };
         assert_eq!(
-            decode_string_table(buffer, None, &plain, false).unwrap(),
+            flat(decode_string_table(buffer, None, &plain, false).unwrap()),
             want
         );
         assert_eq!(
-            decode_string_table(buffer, None, &packed, true).unwrap(),
+            flat(decode_string_table(buffer, None, &packed, true).unwrap()),
             want
         );
     }
@@ -1166,8 +1221,8 @@ mod tests {
         let packed = [1u32, 1, 3, 4];
         let decoded = decode_string_table(buffer, None, &packed, true).unwrap();
         assert_eq!(decoded.len(), packed.len());
-        assert_eq!(decoded[0], b"a");
-        assert_eq!(decoded[3], b"cccc");
+        assert_eq!(decoded.get(0), Some(&b"a"[..]));
+        assert_eq!(decoded.get(3), Some(&b"cccc"[..]));
     }
 
     #[test]
@@ -1193,12 +1248,13 @@ mod tests {
         let packed = deltas(&plain);
 
         let want: Vec<Vec<u8>> = vec![b"DwarFS!".to_vec(), b"DwarFS!".to_vec()];
+        let flat = |t: StringTable| -> Vec<Vec<u8>> { t.iter().map(<[u8]>::to_vec).collect() };
         assert_eq!(
-            decode_string_table(&buffer, Some(&symtab), &plain, false).unwrap(),
+            flat(decode_string_table(&buffer, Some(&symtab), &plain, false).unwrap()),
             want
         );
         assert_eq!(
-            decode_string_table(&buffer, Some(&symtab), &packed, true).unwrap(),
+            flat(decode_string_table(&buffer, Some(&symtab), &packed, true).unwrap()),
             want
         );
     }
