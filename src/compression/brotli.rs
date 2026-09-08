@@ -25,7 +25,7 @@ pub(super) fn decompress(src: &[u8], cap: usize) -> Result<Vec<u8>, Error> {
     }
 
     let mut decoder = brotli::Decompressor::new(&src[consumed..], 4096);
-    let mut sink = CappedWriter::new(cap);
+    let mut sink = CappedWriter::with_expected_size(cap, declared as usize);
     let mut buf = [0u8; 8192];
     loop {
         match decoder.read(&mut buf) {

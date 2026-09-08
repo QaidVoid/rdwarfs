@@ -24,6 +24,17 @@ impl CappedWriter {
         }
     }
 
+    /// Reserve for an output size the caller already knows, so a large
+    /// payload does not grow its buffer a reallocation at a time. The
+    /// cap is still enforced, and the hint is clamped to it so a
+    /// declared size cannot drive the allocation.
+    pub fn with_expected_size(cap: usize, expected: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(expected.min(cap)),
+            cap,
+        }
+    }
+
     /// Consume the writer and return the buffered bytes.
     pub fn into_inner(self) -> Vec<u8> {
         self.buf

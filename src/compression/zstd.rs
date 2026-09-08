@@ -1,11 +1,12 @@
 //! ZSTD codec.
 //!
 //! Framing: a single ZSTD frame carrying the content size in its
-//! frame header (DwarFS format spec, "Compression Algorithms"). The
-//! decoder streams output through a [`CappedWriter`] so a hostile
-//! frame cannot allocate beyond the caller's cap. The encoder uses
-//! `zstd::encode_all`, which already writes the content size into the
-//! frame header.
+//! frame header (DwarFS format spec, "Compression Algorithms").
+//!
+//! A frame that declares its size decodes in one shot into an
+//! exactly-sized buffer. A frame that does not falls back to streaming
+//! through a [`CappedWriter`], so a hostile frame cannot allocate
+//! beyond the caller's cap either way.
 
 #[cfg(feature = "read")]
 use std::io;
@@ -16,6 +17,20 @@ use crate::compression::capped::CappedWriter;
 
 #[cfg(feature = "read")]
 pub(super) fn decompress(src: &[u8], cap: usize) -> Result<Vec<u8>, Error> {
+    // Streaming decode moves output through an 8 KiB intermediate and
+    // grows the destination as it goes. Decoding a declared-size frame
+    // straight into an exact buffer is several times faster, and block
+    // payloads always declare their size.
+    if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(src) {
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        if size > cap {
+            return Err(Error::Decode {
+                codec: "zstd",
+                message: format!("frame declares {size} bytes, cap is {cap}"),
+            });
+        }
+        return zstd::bulk::decompress(src, size).map_err(map_decode);
+    }
     let mut decoder = zstd::Decoder::with_buffer(src).map_err(map_decode)?;
     let mut sink = CappedWriter::new(cap);
     io::copy(&mut decoder, &mut sink).map_err(map_decode)?;
