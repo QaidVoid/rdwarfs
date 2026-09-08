@@ -721,11 +721,7 @@ impl Filesystem {
         let mut out = Vec::with_capacity(end - begin);
         for i in begin..end {
             let de = self.dir_entries[i];
-            let name = self
-                .names
-                .get(de.name_index as usize)
-                .ok_or_else(|| corrupt(format!("name index {} out of range", de.name_index)))?
-                .clone();
+            let name = self.entry_name(de.name_index)?.to_vec();
             let kind = self.kind(de.inode_num)?;
             out.push(Listing {
                 inode: de.inode_num,
@@ -736,19 +732,39 @@ impl Filesystem {
         Ok(out)
     }
 
+    /// Find a child of `dir_inode` by name.
+    ///
+    /// Returns `None` when the directory has no such entry. Allocates
+    /// nothing, so a path walk does not build a listing per component.
+    ///
+    /// Spec: `doc/dwarfs-format.md`, "Traversing the Metadata". Entries
+    /// within a directory are ordered by name, so this is a binary
+    /// search rather than a scan.
+    pub fn lookup_child(&self, dir_inode: u32, name: &[u8]) -> Result<Option<u32>, Error> {
+        if self.kind(dir_inode)? != InodeKind::Directory {
+            return Err(corrupt(format!("inode {dir_inode} is not a directory")));
+        }
+        self.lookup_one(dir_inode, name)
+    }
+
+    fn entry_name(&self, index: u32) -> Result<&[u8], Error> {
+        self.names
+            .get(index as usize)
+            .map(Vec::as_slice)
+            .ok_or_else(|| corrupt(format!("name index {index} out of range")))
+    }
+
     fn lookup_one(&self, dir_inode: u32, name: &[u8]) -> Result<Option<u32>, Error> {
         let (begin, end) = self.dir_entry_range(dir_inode)?;
-        // dir_entries are sorted by name (asciibetically) per spec; a
-        // tiny tree benefits from linear scan, large trees should
-        // binary-search. Use a simple scan for now.
-        for i in begin..end {
-            let de = self.dir_entries[i];
-            let entry_name = self
-                .names
-                .get(de.name_index as usize)
-                .ok_or_else(|| corrupt(format!("name index {} out of range", de.name_index)))?;
-            if entry_name.as_slice() == name {
-                return Ok(Some(de.inode_num));
+        let mut lo = begin;
+        let mut hi = end;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let de = self.dir_entries[mid];
+            match self.entry_name(de.name_index)?.cmp(name) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(de.inode_num)),
             }
         }
         Ok(None)
