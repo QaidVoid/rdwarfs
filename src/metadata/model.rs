@@ -12,7 +12,7 @@
 use crate::Error;
 use crate::metadata::frozen::{FieldView, Frozen, LayoutKind, Pos};
 use crate::metadata::fsst::SymTable;
-use crate::metadata::schema::{Layout, Schema};
+use crate::metadata::schema::{Field, Layout, Schema};
 
 /// Maximum element count accepted for any list when no explicit cap is
 /// passed. 64 million entries is comfortably larger than any
@@ -149,6 +149,53 @@ pub struct Metadata<'a> {
     root_layout: &'a Layout,
 }
 
+/// A struct field resolved once for a whole list: where it sits within
+/// the struct and how wide it is.
+#[derive(Debug, Clone, Copy)]
+struct Column {
+    field: Option<Field>,
+    bits: u32,
+}
+
+impl Column {
+    const ABSENT: Self = Self {
+        field: None,
+        bits: 0,
+    };
+}
+
+struct InodeColumns {
+    mode: Column,
+    owner: Column,
+    group: Column,
+    atime: Column,
+    mtime: Column,
+    ctime: Column,
+    btime: Column,
+    atime_subsec: Column,
+    mtime_subsec: Column,
+    ctime_subsec: Column,
+    btime_subsec: Column,
+    nlink: Column,
+}
+
+struct ChunkColumns {
+    block: Column,
+    offset: Column,
+    size: Column,
+}
+
+struct DirEntryColumns {
+    name_index: Column,
+    inode_num: Column,
+}
+
+struct DirectoryColumns {
+    parent_entry: Column,
+    first_entry: Column,
+    self_entry: Column,
+}
+
 impl<'a> Metadata<'a> {
     /// Build a new typed view over the given schema and decoded blob.
     pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self, Error> {
@@ -218,23 +265,42 @@ impl<'a> Metadata<'a> {
 
     /// Decoded list of chunks (field 1).
     pub fn chunks(&self) -> Result<Vec<Chunk>, Error> {
-        self.decode_struct_list(ids::CHUNKS, |item_layout, pos| {
-            Ok(Chunk {
-                block: self.read_struct_u32(pos, item_layout, 1)?,
-                offset: self.read_struct_u32(pos, item_layout, 2)?,
-                size: self.read_struct_u32(pos, item_layout, 3)?,
-            })
-        })
+        self.decode_struct_list(
+            ids::CHUNKS,
+            |l| {
+                Ok(ChunkColumns {
+                    block: self.column(l, 1)?,
+                    offset: self.column(l, 2)?,
+                    size: self.column(l, 3)?,
+                })
+            },
+            |c, pos| {
+                Ok(Chunk {
+                    block: self.read_column_u32(pos, c.block)?,
+                    offset: self.read_column_u32(pos, c.offset)?,
+                    size: self.read_column_u32(pos, c.size)?,
+                })
+            },
+        )
     }
 
     /// Decoded list of directory entries (field 19).
     pub fn dir_entries(&self) -> Result<Vec<DirEntry>, Error> {
-        self.decode_struct_list(ids::DIR_ENTRIES, |item_layout, pos| {
-            Ok(DirEntry {
-                name_index: self.read_struct_u32(pos, item_layout, 1)?,
-                inode_num: self.read_struct_u32(pos, item_layout, 2)?,
-            })
-        })
+        self.decode_struct_list(
+            ids::DIR_ENTRIES,
+            |l| {
+                Ok(DirEntryColumns {
+                    name_index: self.column(l, 1)?,
+                    inode_num: self.column(l, 2)?,
+                })
+            },
+            |c, pos| {
+                Ok(DirEntry {
+                    name_index: self.read_column_u32(pos, c.name_index)?,
+                    inode_num: self.read_column_u32(pos, c.inode_num)?,
+                })
+            },
+        )
     }
 
     /// Shared-files table (field 20), already unpacked.
@@ -415,22 +481,41 @@ impl<'a> Metadata<'a> {
 
     /// Decoded list of inodes (field 3).
     pub fn inodes(&self) -> Result<Vec<InodeData>, Error> {
-        self.decode_struct_list(ids::INODES, |item_layout, pos| {
-            Ok(InodeData {
-                mode_index: self.read_struct_u32(pos, item_layout, 2)?,
-                owner_index: self.read_struct_u32(pos, item_layout, 4)?,
-                group_index: self.read_struct_u32(pos, item_layout, 5)?,
-                atime_offset: self.read_struct_int(pos, item_layout, 6)?,
-                mtime_offset: self.read_struct_int(pos, item_layout, 7)?,
-                ctime_offset: self.read_struct_int(pos, item_layout, 8)?,
-                btime_offset: self.read_struct_int(pos, item_layout, 9)?,
-                atime_subsec: self.read_struct_int(pos, item_layout, 10)?,
-                mtime_subsec: self.read_struct_int(pos, item_layout, 11)?,
-                ctime_subsec: self.read_struct_int(pos, item_layout, 12)?,
-                btime_subsec: self.read_struct_int(pos, item_layout, 13)?,
-                nlink_minus_one: self.read_struct_u32(pos, item_layout, 14)?,
-            })
-        })
+        self.decode_struct_list(
+            ids::INODES,
+            |l| {
+                Ok(InodeColumns {
+                    mode: self.column(l, 2)?,
+                    owner: self.column(l, 4)?,
+                    group: self.column(l, 5)?,
+                    atime: self.column(l, 6)?,
+                    mtime: self.column(l, 7)?,
+                    ctime: self.column(l, 8)?,
+                    btime: self.column(l, 9)?,
+                    atime_subsec: self.column(l, 10)?,
+                    mtime_subsec: self.column(l, 11)?,
+                    ctime_subsec: self.column(l, 12)?,
+                    btime_subsec: self.column(l, 13)?,
+                    nlink: self.column(l, 14)?,
+                })
+            },
+            |c, pos| {
+                Ok(InodeData {
+                    mode_index: self.read_column_u32(pos, c.mode)?,
+                    owner_index: self.read_column_u32(pos, c.owner)?,
+                    group_index: self.read_column_u32(pos, c.group)?,
+                    atime_offset: self.read_column(pos, c.atime)?,
+                    mtime_offset: self.read_column(pos, c.mtime)?,
+                    ctime_offset: self.read_column(pos, c.ctime)?,
+                    btime_offset: self.read_column(pos, c.btime)?,
+                    atime_subsec: self.read_column(pos, c.atime_subsec)?,
+                    mtime_subsec: self.read_column(pos, c.mtime_subsec)?,
+                    ctime_subsec: self.read_column(pos, c.ctime_subsec)?,
+                    btime_subsec: self.read_column(pos, c.btime_subsec)?,
+                    nlink_minus_one: self.read_column_u32(pos, c.nlink)?,
+                })
+            },
+        )
     }
 
     /// Decoded devices table (field 17). Each entry is an encoded
@@ -449,13 +534,23 @@ impl<'a> Metadata<'a> {
     /// inclusive-prefix-sum the `first_entry` column to recover real
     /// indices.
     pub fn directories(&self) -> Result<Vec<Directory>, Error> {
-        self.decode_struct_list(ids::DIRECTORIES, |item_layout, pos| {
-            Ok(Directory {
-                parent_entry: self.read_struct_u32(pos, item_layout, 1)?,
-                first_entry: self.read_struct_u32(pos, item_layout, 2)?,
-                self_entry: self.read_struct_u32(pos, item_layout, 3)?,
-            })
-        })
+        self.decode_struct_list(
+            ids::DIRECTORIES,
+            |l| {
+                Ok(DirectoryColumns {
+                    parent_entry: self.column(l, 1)?,
+                    first_entry: self.column(l, 2)?,
+                    self_entry: self.column(l, 3)?,
+                })
+            },
+            |c, pos| {
+                Ok(Directory {
+                    parent_entry: self.read_column_u32(pos, c.parent_entry)?,
+                    first_entry: self.read_column_u32(pos, c.first_entry)?,
+                    self_entry: self.read_column_u32(pos, c.self_entry)?,
+                })
+            },
+        )
     }
 
     /// Optional preferred path separator code point. Returns `None`
@@ -541,10 +636,18 @@ impl<'a> Metadata<'a> {
     /// Decode a root `list<struct>` field by calling `decoder` for
     /// every element with the per-element struct layout and position.
     /// Accepts both bare lists and `Optional<list<...>>` wrappers.
-    fn decode_struct_list<T>(
+    /// Decode every element of a struct list.
+    ///
+    /// `prepare` runs once against the item layout and resolves the
+    /// fields the decoder reads; `decode` then runs per element.
+    /// Resolving a field costs two map lookups, and a large table has
+    /// tens of thousands of elements, so resolving per element rather
+    /// than per list dominates the cost of opening an image.
+    fn decode_struct_list<C, T>(
         &self,
         id: i16,
-        decoder: impl Fn(&Layout, Pos) -> Result<T, Error>,
+        prepare: impl Fn(&Layout) -> Result<C, Error>,
+        decode: impl Fn(&C, Pos) -> Result<T, Error>,
     ) -> Result<Vec<T>, Error> {
         let Some((list_layout, list_pos)) = self.resolve_list(id)? else {
             return Ok(Vec::new());
@@ -565,12 +668,40 @@ impl<'a> Metadata<'a> {
             });
         }
         let item_layout = self.schema().layout(item_layout_id)?;
+        let columns = prepare(item_layout)?;
         let mut out = Vec::with_capacity(range.count as usize);
         for i in 0..range.count {
             let pos = self.frozen.element_pos(range, i)?;
-            out.push(decoder(item_layout, pos)?);
+            out.push(decode(&columns, pos)?);
         }
         Ok(out)
+    }
+
+    /// Resolve a struct field once: where it sits and how wide it is.
+    fn column(&self, layout: &Layout, field_id: i16) -> Result<Column, Error> {
+        match layout.field(field_id) {
+            None => Ok(Column::ABSENT),
+            Some(field) => Ok(Column {
+                field: Some(*field),
+                bits: u32::from(self.schema().layout(field.layout_id)?.bits),
+            }),
+        }
+    }
+
+    /// Read a resolved field. An absent field reads as zero.
+    fn read_column(&self, pos: Pos, column: Column) -> Result<u64, Error> {
+        match column.field {
+            None => Ok(0),
+            Some(field) => self.frozen.read_integral(pos.child(&field), column.bits),
+        }
+    }
+
+    fn read_column_u32(&self, pos: Pos, column: Column) -> Result<u32, Error> {
+        let v = self.read_column(pos, column)?;
+        u32::try_from(v).map_err(|_| Error::Decode {
+            codec: "frozen2-model",
+            message: format!("struct field value {v} overflows u32"),
+        })
     }
 
     /// Locate the list layout and position for a root field, unwrapping
@@ -835,36 +966,6 @@ impl<'a> Metadata<'a> {
             .frozen
             .read_integral(struct_pos.child(field), u32::from(layout.bits))?
             != 0)
-    }
-
-    /// Read a struct field as `u32`. Missing fields decode as zero
-    /// (Frozen2 elides zero-byte fields).
-    fn read_struct_u32(
-        &self,
-        struct_pos: Pos,
-        struct_layout: &Layout,
-        field_id: i16,
-    ) -> Result<u32, Error> {
-        let v = self.read_struct_int(struct_pos, struct_layout, field_id)?;
-        u32::try_from(v).map_err(|_| Error::Decode {
-            codec: "frozen2-model",
-            message: format!("struct field {field_id} value {v} overflows u32"),
-        })
-    }
-
-    /// Read a struct field as `u64`. Missing fields decode as zero.
-    fn read_struct_int(
-        &self,
-        struct_pos: Pos,
-        struct_layout: &Layout,
-        field_id: i16,
-    ) -> Result<u64, Error> {
-        let Some(field) = struct_layout.field(field_id) else {
-            return Ok(0);
-        };
-        let layout = self.schema().layout(field.layout_id)?;
-        self.frozen
-            .read_integral(struct_pos.child(field), u32::from(layout.bits))
     }
 
     /// Read a root `list<integral>` field with an explicit element
