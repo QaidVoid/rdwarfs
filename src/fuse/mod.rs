@@ -174,11 +174,6 @@ impl FuseFilesystem for DwarfsFuse {
     }
 
     fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        // A DwarFS image is immutable, so cached pages can never go
-        // stale. Without this the kernel discards a file's pages on
-        // every close and re-reads them through the daemon, which
-        // costs a round trip per read that the page cache could have
-        // served outright.
         reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
@@ -256,36 +251,41 @@ impl FuseFilesystem for DwarfsFuse {
         // Synthesize "." and ".." entries the kernel expects. The root
         // is its own parent.
         let parent_ino = self.fs.parent(dwarfs_ino).unwrap_or(dwarfs_ino);
-        let mut entries: Vec<(INodeNo, FileType, Vec<u8>)> = vec![
-            (
-                Self::fuse_ino(dwarfs_ino),
-                FileType::Directory,
-                b".".to_vec(),
-            ),
-            (
-                Self::fuse_ino(parent_ino),
-                FileType::Directory,
-                b"..".to_vec(),
-            ),
+        let dot = [
+            (Self::fuse_ino(dwarfs_ino), FileType::Directory, "."),
+            (Self::fuse_ino(parent_ino), FileType::Directory, ".."),
         ];
-        let listing = match self.fs.read_dir(dwarfs_ino) {
-            Ok(v) => v,
-            Err(_) => {
+
+        // Emit straight from the directory rather than collecting it
+        // first: a listing allocates a name per entry, and the kernel
+        // calls readdir again for every batch it asks for.
+        let mut index = 0u64;
+        let mut full = false;
+        for (ino, kind, name) in dot {
+            if index >= offset && reply.add(ino, index + 1, kind, name) {
+                full = true;
+                break;
+            }
+            index += 1;
+        }
+        if !full {
+            let walked = self.fs.for_each_entry(dwarfs_ino, |child, kind, name| {
+                if index < offset {
+                    index += 1;
+                    return true;
+                }
+                let done = reply.add(
+                    Self::fuse_ino(child),
+                    index + 1,
+                    file_type(kind),
+                    OsStr::from_bytes(name),
+                );
+                index += 1;
+                !done
+            });
+            if walked.is_err() {
                 reply.error(Errno::ENOTDIR);
                 return;
-            }
-        };
-        for l in listing {
-            entries.push((Self::fuse_ino(l.inode), file_type(l.kind), l.name));
-        }
-        for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            let next_offset = (i as u64) + 1;
-            // `OsStr::from_bytes` accepts any byte sequence on Unix,
-            // including non-UTF-8 names DwarFS may legitimately
-            // store.
-            let name_os = OsStr::from_bytes(&name);
-            if reply.add(ino, next_offset, kind, name_os) {
-                break;
             }
         }
         reply.ok();

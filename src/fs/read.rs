@@ -538,6 +538,11 @@ impl Filesystem {
         let range = self.chunk_range(inode)?;
         let want_end = offset.saturating_add(buf.len() as u64);
         let mut written = 0usize;
+        // Consecutive chunks of a file usually sit in the same block,
+        // and a read spanning a heavily chunked region visits hundreds
+        // of them. Holding the last one avoids taking the cache lock
+        // and hashing the block index once per chunk.
+        let mut held: Option<(u32, Arc<Vec<u8>>)> = None;
 
         for i in self.chunks_covering(&range, offset) {
             if written == buf.len() {
@@ -561,7 +566,16 @@ impl Filesystem {
             } else {
                 let block_start = chunk.offset as usize + local_start as usize;
                 let block_end = block_start + take;
-                let block = self.decode_block(cache, chunk.block, block_end)?;
+                let block = match &held {
+                    Some((b, bytes)) if *b == chunk.block && bytes.len() >= block_end => {
+                        Arc::clone(bytes)
+                    }
+                    _ => {
+                        let bytes = self.decode_block(cache, chunk.block, block_end)?;
+                        held = Some((chunk.block, Arc::clone(&bytes)));
+                        bytes
+                    }
+                };
                 if block_end > block.len() {
                     return Err(corrupt(format!(
                         "chunk {block_start}..{block_end} exceeds block of {} bytes",
@@ -765,6 +779,30 @@ impl Filesystem {
         self.names
             .get(index as usize)
             .ok_or_else(|| corrupt(format!("name index {index} out of range")))
+    }
+
+    /// Visit a directory's entries in order, without building a listing.
+    ///
+    /// `visit` receives each entry's inode, kind and name; returning
+    /// `false` stops the walk. Names borrow from the string table, so
+    /// a caller that only needs to look at them allocates nothing.
+    pub fn for_each_entry(
+        &self,
+        inode: u32,
+        mut visit: impl FnMut(u32, InodeKind, &[u8]) -> bool,
+    ) -> Result<(), Error> {
+        if self.kind(inode)? != InodeKind::Directory {
+            return Err(corrupt(format!("inode {inode} is not a directory")));
+        }
+        let (begin, end) = self.dir_entry_range(inode)?;
+        for i in begin..end {
+            let de = self.dir_entries[i];
+            let name = self.entry_name(de.name_index)?;
+            if !visit(de.inode_num, self.kind(de.inode_num)?, name) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn lookup_one(&self, dir_inode: u32, name: &[u8]) -> Result<Option<u32>, Error> {
