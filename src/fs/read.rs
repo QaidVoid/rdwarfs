@@ -2,7 +2,7 @@
 //! the `read` feature; the public surface from `fs/mod.rs` reexports
 //! everything declared here.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::Error;
@@ -48,6 +48,14 @@ fn check_features(features: &[String]) -> Result<(), Error> {
 /// what one small read needs would decode again for the next read a
 /// little further in, so round up.
 const PREFIX_GRANULARITY: usize = 1 << 20;
+
+/// Largest prefix worth decoding partially.
+///
+/// A partial decode is a bet that the caller will not want the rest of
+/// the block. Losing that bet costs the prefix plus a full decode, so
+/// only take it when the prefix is small: a read far into a block is
+/// served by decoding the block outright.
+const PREFIX_MAX: usize = 4 << 20;
 
 const CAP_SCHEMA_BYTES: usize = 1 << 20;
 const CAP_METADATA_BYTES: usize = 64 * 1024 * 1024;
@@ -881,16 +889,14 @@ impl Filesystem {
         block: u32,
         needed: usize,
     ) -> Result<Arc<Vec<u8>>, Error> {
-        cache.fetch(block, needed, |retry_in_full| {
+        let whole = self.block_size as usize;
+        cache.fetch(block, needed, whole, |retry_in_full| {
             let record = self
                 .block_records
                 .get(block as usize)
                 .ok_or_else(|| corrupt(format!("block {block} out of range")))?;
             let full = self.block_size as usize;
-            // Past this point the tail is cheap enough that decoding it
-            // now beats decoding the block again for the next read.
-            let prefix_limit = full - full / 4;
-            if !retry_in_full && needed < prefix_limit {
+            if !retry_in_full && needed <= PREFIX_MAX.min(full) {
                 let want = needed.max(PREFIX_GRANULARITY).min(full);
                 if let Some(bytes) = self.image.decompress_section_prefix(record, want)? {
                     return Ok(bytes);
@@ -1182,6 +1188,10 @@ pub struct BlockCache {
 
 #[derive(Default)]
 struct Inner {
+    /// Blocks that have been decoded in full at least once. A block
+    /// the caller has already read through is not a candidate for a
+    /// partial decode again: the bet has been lost once already.
+    decoded_whole: HashSet<u32>,
     resident: usize,
     blocks: HashMap<u32, Entry>,
     /// Resident blocks, least-recently-used first.
@@ -1249,7 +1259,13 @@ impl BlockCache {
     /// An entry may be a prefix of its block, because a read near the
     /// front of a large block decodes only as far as it has to. A
     /// later read that reaches past that prefix decodes again.
-    fn fetch<F>(&self, block: u32, needed: usize, decode: F) -> Result<Arc<Vec<u8>>, Error>
+    fn fetch<F>(
+        &self,
+        block: u32,
+        needed: usize,
+        whole: usize,
+        decode: F,
+    ) -> Result<Arc<Vec<u8>>, Error>
     where
         F: FnOnce(bool) -> Result<Vec<u8>, Error>,
     {
@@ -1267,8 +1283,12 @@ impl BlockCache {
                     return Ok(bytes);
                 }
                 // Resident, but only as a prefix that stops short of
-                // this read. Decode the block in full this time.
+                // this read. Drop it before decoding in full, or its
+                // bytes stay counted against the budget for good and
+                // the cache starts evicting blocks it still has room
+                // for.
                 Some(Entry::Ready(_)) => {
+                    inner.evict(block);
                     retry_in_full = true;
                     break;
                 }
@@ -1278,6 +1298,7 @@ impl BlockCache {
                 None => break,
             }
         }
+        retry_in_full |= inner.decoded_whole.contains(&block);
         inner.blocks.insert(block, Entry::Loading);
         drop(inner);
 
@@ -1289,6 +1310,9 @@ impl BlockCache {
             armed: true,
         };
         let bytes = Arc::new(decode(retry_in_full)?);
+        if bytes.len() >= whole {
+            self.lock().decoded_whole.insert(block);
+        }
         in_flight.publish(Arc::clone(&bytes));
         Ok(bytes)
     }
@@ -1311,6 +1335,16 @@ impl Inner {
         if let Some(pos) = self.order.iter().position(|b| *b == block) {
             let key = self.order.remove(pos).expect("position is in range");
             self.order.push_back(key);
+        }
+    }
+
+    /// Drop one block and stop counting its bytes.
+    fn evict(&mut self, block: u32) {
+        if let Some(Entry::Ready(bytes)) = self.blocks.remove(&block) {
+            self.resident -= bytes.len();
+        }
+        if let Some(pos) = self.order.iter().position(|b| *b == block) {
+            self.order.remove(pos);
         }
     }
 
@@ -1433,7 +1467,7 @@ mod tests {
 
     fn fill(cache: &BlockCache, block: u32, size: usize) -> Arc<Vec<u8>> {
         cache
-            .fetch(block, size, |_| Ok(vec![block as u8; size]))
+            .fetch(block, size, size, |_| Ok(vec![block as u8; size]))
             .expect("filling a cache block cannot fail")
     }
 
@@ -1483,7 +1517,7 @@ mod tests {
                 scope.spawn(|| {
                     start.wait();
                     let bytes = cache
-                        .fetch(0, 4096, |_| {
+                        .fetch(0, 4096, 4096, |_| {
                             decodes.fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(20));
                             Ok(vec![7u8; 4096])
@@ -1511,7 +1545,7 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     start.wait();
-                    let outcome = cache.fetch(0, 1, |_| {
+                    let outcome = cache.fetch(0, 1, 1, |_| {
                         std::thread::sleep(Duration::from_millis(20));
                         Err(corrupt("block 0 is corrupt".to_string()))
                     });
@@ -1520,7 +1554,7 @@ mod tests {
             }
         });
 
-        let retried = cache.fetch(0, 1, |_| Ok(vec![1u8; 8]));
+        let retried = cache.fetch(0, 1, 1, |_| Ok(vec![1u8; 8]));
         assert!(retried.is_ok(), "a failed decode is not cached");
     }
 
@@ -1535,14 +1569,14 @@ mod tests {
                 // The panic unwinds out of fetch; the other thread must
                 // not be left waiting on a block nobody is loading.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cache.fetch(0, 1, |_| panic!("decode panicked"))
+                    cache.fetch(0, 1, 1, |_| panic!("decode panicked"))
                 }));
             });
             scope.spawn(|| {
                 start.wait();
                 std::thread::sleep(Duration::from_millis(10));
                 let bytes = cache
-                    .fetch(0, 16, |_| Ok(vec![3u8; 16]))
+                    .fetch(0, 16, 16, |_| Ok(vec![3u8; 16]))
                     .expect("a later decode still succeeds");
                 assert_eq!(bytes.len(), 16);
             });
@@ -1561,7 +1595,7 @@ mod tests {
                 scope.spawn(move || {
                     start.wait();
                     for _ in 0..16 {
-                        let _ = cache.fetch(block, 1024, |_| Ok(vec![block as u8; 1024]));
+                        let _ = cache.fetch(block, 1024, 1024, |_| Ok(vec![block as u8; 1024]));
                         assert!(
                             cache.resident_bytes() <= 4096,
                             "published bytes stay within the budget"
