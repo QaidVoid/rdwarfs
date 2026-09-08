@@ -177,20 +177,37 @@ impl Image {
 
     /// Verify the fast XXH3-64 hash on every section.
     pub fn verify_all(&self) -> Result<(), Error> {
-        for record in &self.sections {
-            verify_xxh3(&record.header, &self.section_bytes(record)?)?;
-        }
-        Ok(())
+        self.verify_sections(false)
     }
 
     /// Verify both the XXH3-64 and SHA-512/256 hash on every section.
     pub fn verify_deep(&self) -> Result<(), Error> {
-        for record in &self.sections {
+        self.verify_sections(true)
+    }
+
+    /// Hash every section, optionally including the slower SHA.
+    ///
+    /// Sections are independent, so on a build with the `parallel`
+    /// feature they are hashed across a thread pool. SHA-512/256 over
+    /// a whole image dominates the cost of a deep check.
+    fn verify_sections(&self, deep: bool) -> Result<(), Error> {
+        let one = |record: &SectionRecord| -> Result<(), Error> {
             let bytes = self.section_bytes(record)?;
             verify_xxh3(&record.header, &bytes)?;
-            verify_sha512_256(&record.header, &bytes)?;
+            if deep {
+                verify_sha512_256(&record.header, &bytes)?;
+            }
+            Ok(())
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            self.sections.par_iter().try_for_each(one)
         }
-        Ok(())
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.sections.iter().try_for_each(one)
+        }
     }
 
     /// Decompress a section payload through the registered codec
