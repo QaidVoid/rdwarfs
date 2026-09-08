@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser};
 
-use rdwarfs::format::Image;
+use rdwarfs::format::{FileSource, Image, ImageSource};
 use rdwarfs::fs::Filesystem;
 use rdwarfs::fuse::DwarfsFuse;
 
@@ -40,7 +40,8 @@ struct Cli {
 
     /// Mount option (`-o key=value`), accepted multiple times and
     /// comma-separated. `cachesize=SIZE` sets the decoded-block cache
-    /// budget; anything else is passed through to FUSE.
+    /// budget, `offset=NUM|auto` locates an image embedded in a larger
+    /// file; anything else is passed through to FUSE.
     #[arg(short = 'o', long = "option")]
     options: Vec<String>,
 
@@ -72,9 +73,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Sections are verified lazily as they are loaded, so a mount does
     // not pay for hashing block data it may never read.
-    let (cache_bytes, passthrough) = split_options(&cli.options)?;
+    let (cache_bytes, offset, passthrough) = split_options(&cli.options)?;
 
-    let image = Image::open(&cli.image)?;
+    let image = open_image(&cli.image, offset)?;
     let fs = Filesystem::open(image)?;
     let adapter = match cache_bytes {
         Some(bytes) => DwarfsFuse::with_cache(fs, bytes),
@@ -105,23 +106,63 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Pull `cachesize` out of the `-o` list, returning it and the options
-/// that belong to FUSE. Values may be comma-separated within one `-o`.
-fn split_options(
-    options: &[String],
-) -> Result<(Option<usize>, Vec<String>), Box<dyn std::error::Error>> {
+/// Where an image begins inside the file holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offset {
+    /// The file is the image.
+    Start,
+    /// Scan for the first section header.
+    Detect,
+    /// Seek straight to this byte offset.
+    At(u64),
+}
+
+type SplitOptions = (Option<usize>, Offset, Vec<String>);
+
+/// Pull `cachesize` and `offset` out of the `-o` list, returning them
+/// and the options that belong to FUSE. Values may be comma-separated
+/// within one `-o`.
+fn split_options(options: &[String]) -> Result<SplitOptions, Box<dyn std::error::Error>> {
     let mut cache = None;
+    let mut offset = Offset::Start;
     let mut rest = Vec::new();
     for raw in options {
         for opt in raw.split(',') {
-            match opt.strip_prefix("cachesize=") {
-                Some(value) => cache = Some(parse_size(value)?),
-                None if opt.is_empty() => {}
-                None => rest.push(opt.to_string()),
+            if let Some(value) = opt.strip_prefix("cachesize=") {
+                cache = Some(parse_size(value)?);
+            } else if let Some(value) = opt.strip_prefix("offset=") {
+                offset =
+                    match value {
+                        "auto" => Offset::Detect,
+                        other => Offset::At(other.parse::<u64>().map_err(|_| {
+                            format!("offset must be `auto` or a byte offset: {other}")
+                        })?),
+                    };
+            } else if !opt.is_empty() {
+                rest.push(opt.to_string());
             }
         }
     }
-    Ok((cache, rest))
+    Ok((cache, offset, rest))
+}
+
+/// Open the image, honouring an embedded offset.
+///
+/// Reads positionally rather than mapping the file. A mount is
+/// long-lived, and mapping it charges every faulted-in page of the
+/// compressed image to the daemon's RSS: on a 434 MB image that is
+/// another 262 MB resident, for no gain in read speed.
+fn open_image(path: &PathBuf, offset: Offset) -> Result<Image, Box<dyn std::error::Error>> {
+    let source = FileSource::open(path)?;
+    match offset {
+        // `from_source` scans for the first section header itself, so
+        // detection and the plain case share a path.
+        Offset::Start | Offset::Detect => Ok(Image::from_source(source)?),
+        Offset::At(at) => {
+            let len = ImageSource::len(&source).saturating_sub(at);
+            Ok(Image::from_window(source, at, len)?)
+        }
+    }
 }
 
 /// Parse a byte size with an optional binary suffix, as upstream
@@ -151,7 +192,7 @@ fn parse_size(value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_size, split_options};
+    use super::{Offset, parse_size, split_options};
 
     #[test]
     fn sizes_accept_binary_suffixes() {
@@ -170,8 +211,9 @@ mod tests {
             "cachesize=256M,allow_root".to_string(),
             "kernel_cache".to_string(),
         ];
-        let (cache, rest) = split_options(&opts).expect("parse");
+        let (cache, offset, rest) = split_options(&opts).expect("parse");
         assert_eq!(cache, Some(256 << 20));
+        assert_eq!(offset, Offset::Start);
         assert_eq!(
             rest,
             vec!["allow_root".to_string(), "kernel_cache".to_string()]
@@ -179,9 +221,22 @@ mod tests {
     }
 
     #[test]
-    fn absent_cachesize_leaves_the_default() {
-        let (cache, rest) = split_options(&["ro".to_string()]).expect("parse");
+    fn absent_options_leave_the_defaults() {
+        let (cache, offset, rest) = split_options(&["ro".to_string()]).expect("parse");
         assert_eq!(cache, None);
+        assert_eq!(offset, Offset::Start);
         assert_eq!(rest, vec!["ro".to_string()]);
+    }
+
+    #[test]
+    fn offset_accepts_auto_and_a_number() {
+        let (_, offset, rest) = split_options(&["offset=auto".to_string()]).expect("parse");
+        assert_eq!(offset, Offset::Detect);
+        assert!(rest.is_empty(), "offset is consumed, not passed to FUSE");
+
+        let (_, offset, _) = split_options(&["offset=123456".to_string()]).expect("parse");
+        assert_eq!(offset, Offset::At(123_456));
+
+        assert!(split_options(&["offset=nope".to_string()]).is_err());
     }
 }
